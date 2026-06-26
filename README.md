@@ -91,21 +91,3 @@ UIs after it's up: **LightRAG** on `:9621`, **Langfuse** on `:3000`.
    ingress for TLS). Same artifact, now public.
 4. **Day-2** — bump a component's `image-tag` / package version; persistent volumes
    survive the upgrade.
-
-## Known gaps / things to verify before a live run
-
-- **LightRAG storage wiring.** The app selects backends via the
-  `LIGHTRAG_*_STORAGE` selector env vars (the names the image actually reads —
-  an earlier `VECTOR_STORAGE` name was wrong and silently fell back to the
-  Nano/JSON/NetworkX file defaults): vector → Qdrant
-  (`LIGHTRAG_VECTOR_STORAGE=QdrantVectorDBStorage`, `QDRANT_URL`), KV → Redis
-  (`LIGHTRAG_KV_STORAGE=RedisKVStorage`, `REDIS_URI`), and doc-status → Postgres
-  (`LIGHTRAG_DOC_STATUS_STORAGE=PGDocStatusStorage`, `POSTGRES_*`). The graph
-  store stays on the default `NetworkXStorage`: this stack has no graph DB
-  (Neo4j/Memgraph) and `PGGraphStorage` needs the Apache AGE extension, which the
-  stock postgres image lacks.
-- **Readiness endpoint** assumes Ollama `/api/tags` returns 200 (on the inherited
-  `web` service).
-- **Deployed once locally; not yet re-verified end-to-end.** The kit has been
-  brought up locally and the backends are wired, but a full RAG round-trip with
-  the corrected `LIGHTRAG_*_STORAGE` selectors has not been re-verified yet.
