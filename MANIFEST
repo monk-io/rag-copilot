@@ -1,0 +1,3 @@
+REPO rag-copilot
+LOAD stack.yaml
+SECRET postgres-password

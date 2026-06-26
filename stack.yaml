@@ -1,0 +1,300 @@
+namespace: rag-copilot
+
+# Backends reuse official monk.io hub packages via `inherits:`.
+# Only the LightRAG app is a custom wrapper (no hub package exists for it yet).
+# Inherited services to target in connections:
+#   ollama/ollama -> "api", qdrant/server -> "qdrant",
+#   postgresql/db -> "postgres", redis/redis -> "redis-svc".
+# Cross-service addresses resolve at runtime over overlay DNS via
+# connection-hostname(...)/connection-port(...); secrets via secret(...).
+
+ollama:
+  defines: runnable
+  inherits: monk-ollama/ollama
+  metadata:
+    name: ollama
+    description: Local LLM inference (OpenAI-compatible) with auto-pulled models.
+  variables:
+    llm-model:
+      # Small, fast model so entity extraction finishes within the LLM timeout
+      # on a CPU node (llama3.1 8B is too slow on CPU and times out).
+      type: string
+      value: llama3.2:1b
+      env: OLLAMA_DEFAULT_MODEL
+    embedding-model:
+      type: string
+      value: nomic-embed-text
+      env: OLLAMA_EMBEDDING_MODEL
+  containers:
+    ollama:
+      # Hub image only runs `serve`; pull configured models on first boot
+      # (cached on the volume below) so the demo is truly one-command.
+      bash: |
+        ollama serve &
+        SERVE_PID=$!
+        until ollama list >/dev/null 2>&1; do sleep 1; done
+        ollama pull "$OLLAMA_DEFAULT_MODEL"
+        ollama pull "$OLLAMA_EMBEDDING_MODEL"
+        wait $SERVE_PID
+      paths:
+        - <- `${volume-path}/ollama:/root/.ollama`
+  checks:
+    readiness:
+      code: http-get-service("rag-copilot/ollama", "api", "/api/tags") get-member("status") 200 eq?
+      period: 10
+
+qdrant:
+  defines: runnable
+  inherits: qdrant/server
+  metadata:
+    name: qdrant
+    description: Qdrant vector database for RAG embeddings.
+
+postgres:
+  defines: runnable
+  inherits: postgresql/db
+  metadata:
+    name: postgres
+    description: PostgreSQL relational state for the app.
+  permitted-secrets:
+    postgres-password: true
+  variables:
+    db_user:
+      type: string
+      value: ragcopilot
+      env: POSTGRES_USER
+    db_name:
+      type: string
+      value: ragcopilot
+      env: POSTGRES_DB
+    db_pass:
+      type: string
+      value: <- secret("postgres-password")
+      env: POSTGRES_PASSWORD
+    version:
+      type: string
+      value: "16"
+
+redis:
+  defines: runnable
+  inherits: redis/redis
+  metadata:
+    name: redis
+    description: Redis cache / KV for the app.
+
+# Langfuse runs against a clean DB we build from the postgresql/db package
+# instead of the flaky hub langfuse/database (which sets duplicate conflicting
+# POSTGRES_* env vars and never passes readiness in langfuse/server's window).
+# langfuse/server's hardcoded DATABASE_URL is
+#   postgresql://postgres:postgres@${database-host}:${database-port}/db
+# so this DB must expose user=postgres / password=postgres / dbname=db on the
+# inherited service named `postgres`.
+langfuse-db:
+  defines: runnable
+  inherits: postgresql/db
+  metadata:
+    name: langfuse-db
+    description: Clean PostgreSQL for Langfuse (replaces the flaky hub langfuse/database).
+  variables:
+    db_user:
+      type: string
+      value: postgres
+      env: POSTGRES_USER
+    db_pass:
+      type: string
+      value: postgres
+      env: POSTGRES_PASSWORD
+    db_name:
+      type: string
+      value: db
+      env: POSTGRES_DB
+    version:
+      type: string
+      value: "16"
+  containers:
+    # Own data volume so we don't collide with rag-copilot/postgres, which keeps
+    # the inherited postgresql/db default path. Inherited container `paths` merge
+    # by index (replace, not append), so this single entry replaces the inherited
+    # path at index 0 -> exactly one mount to /var/lib/postgresql/data.
+    postgres:
+      paths:
+        - <- `${volume-path}/langfuse-db:/var/lib/postgresql/data`
+
+langfuse:
+  defines: runnable
+  inherits: langfuse/server
+  metadata:
+    name: langfuse
+    description: Langfuse observability server, wired to rag-copilot/langfuse-db.
+  connections:
+    database:
+      runnable: rag-copilot/langfuse-db
+      service: postgres
+  depends:
+    wait-for:
+      runnables:
+        - rag-copilot/langfuse-db
+      timeout: 300
+  containers:
+    # Pin to Langfuse v2: the inherited langfuse/server uses image-tag `latest`
+    # (= v3), which requires ClickHouse (not in this stack) and crash-loops.
+    # v2 runs on Postgres alone (our langfuse-db).
+    langfuse:
+      image-tag: "2"
+
+app:
+  defines: runnable
+  metadata:
+    name: rag-copilot-app
+    description: LightRAG app/UI — RAG over Ollama + Qdrant + Postgres + Redis.
+  permitted-secrets:
+    postgres-password: true
+  connections:
+    ollama:
+      runnable: rag-copilot/ollama
+      service: api
+    qdrant:
+      runnable: rag-copilot/qdrant
+      service: qdrant
+    postgres:
+      runnable: rag-copilot/postgres
+      service: postgres
+    redis:
+      runnable: rag-copilot/redis
+      service: redis-svc
+  variables:
+    llm-model:
+      type: string
+      value: llama3.2:1b
+      env: LLM_MODEL
+    embedding-model:
+      type: string
+      value: nomic-embed-text
+      env: EMBEDDING_MODEL
+    # nomic-embed-text produces 768-dim vectors; LightRAG defaults to 1024 and
+    # would create a mismatched Qdrant collection without this.
+    embedding-dim:
+      type: int
+      value: 768
+      env: EMBEDDING_DIM
+    llm-binding:
+      type: string
+      value: ollama
+      env: LLM_BINDING
+    embedding-binding:
+      type: string
+      value: ollama
+      env: EMBEDDING_BINDING
+    # LightRAG storage selectors (env names are LIGHTRAG_*_STORAGE; class
+    # strings come from lightrag/kg/__init__.py STORAGES registry):
+    #   vector     -> Qdrant   (QDRANT_URL)
+    #   kv         -> Redis    (REDIS_URI)
+    #   doc_status -> Postgres (POSTGRES_*)
+    # graph stays on the default NetworkXStorage: this stack has no graph DB
+    # (Neo4j/Memgraph) and PGGraphStorage needs the Apache AGE extension, which
+    # the stock postgres image lacks. Do NOT set LIGHTRAG_GRAPH_STORAGE.
+    vector-storage:
+      type: string
+      value: QdrantVectorDBStorage
+      env: LIGHTRAG_VECTOR_STORAGE
+    kv-storage:
+      type: string
+      value: RedisKVStorage
+      env: LIGHTRAG_KV_STORAGE
+    doc-status-storage:
+      type: string
+      value: PGDocStatusStorage
+      env: LIGHTRAG_DOC_STATUS_STORAGE
+    ollama-host:
+      type: string
+      value: <- connection-hostname("ollama")
+    ollama-port:
+      type: int
+      value: <- connection-port("ollama")
+    qdrant-host:
+      type: string
+      value: <- connection-hostname("qdrant")
+    qdrant-port:
+      type: int
+      value: <- connection-port("qdrant")
+    redis-host:
+      type: string
+      value: <- connection-hostname("redis")
+    redis-port:
+      type: int
+      value: <- connection-port("redis")
+    pg-host:
+      type: string
+      value: <- connection-hostname("postgres")
+      env: POSTGRES_HOST
+    pg-port:
+      type: int
+      value: <- connection-port("postgres")
+      env: POSTGRES_PORT
+    llm-binding-host:
+      type: string
+      value: <- `http://${ollama-host}:${ollama-port}`
+      env: LLM_BINDING_HOST
+    embedding-binding-host:
+      type: string
+      value: <- `http://${ollama-host}:${ollama-port}`
+      env: EMBEDDING_BINDING_HOST
+    qdrant-url:
+      type: string
+      value: <- `http://${qdrant-host}:${qdrant-port}`
+      env: QDRANT_URL
+    redis-uri:
+      type: string
+      value: <- `redis://${redis-host}:${redis-port}`
+      env: REDIS_URI
+    db-user:
+      type: string
+      value: ragcopilot
+      env: POSTGRES_USER
+    db-name:
+      type: string
+      value: ragcopilot
+      env: POSTGRES_DATABASE
+    db-password:
+      type: string
+      value: <- secret("postgres-password")
+      env: POSTGRES_PASSWORD
+  services:
+    web:
+      container: app
+      port: 9621
+      protocol: tcp
+      # Expose LightRAG via the cluster ingress (Traefik) instead of a raw
+      # host-port (which the cloud NSG does not open). A host-less catch-all
+      # route serves the UI at the node domain root over HTTPS:
+      # https://<node-domain>/  (e.g. https://h83l4imag8yctcua5x.runs.onmonk.io/)
+      ingress-routes:
+        web:
+          path-prefix: /
+  containers:
+    app:
+      image: ghcr.io/hkuds/lightrag
+      image-tag: latest
+      restart: on-failure
+  depends:
+    wait-for:
+      runnables:
+        - rag-copilot/ollama
+        - rag-copilot/qdrant
+        - rag-copilot/postgres
+        - rag-copilot/redis
+      timeout: 180
+
+stack:
+  defines: process-group
+  metadata:
+    name: rag-copilot
+    description: Full self-hosted Private RAG Copilot stack.
+  runnable-list:
+    - rag-copilot/ollama
+    - rag-copilot/qdrant
+    - rag-copilot/postgres
+    - rag-copilot/redis
+    - rag-copilot/langfuse-db
+    - rag-copilot/langfuse
+    - rag-copilot/app
